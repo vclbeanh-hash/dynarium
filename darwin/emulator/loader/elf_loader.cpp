@@ -177,40 +177,78 @@ private:
 	if (::uml::runtime::signed_kernel_text_kept(
 		    reinterpret_cast<const void *>(destination), length))
 		return 0;
+
+	/* iOS 16 may return a read-only destination for a shared (copy=FALSE)
+	 * vm_remap even when the carrier lives in signed __TEXT. Request a
+	 * private COW alias instead, as the Dart VM's DuplicateRX does for
+	 * code-signed RX pages. The guest's executable PT_LOAD is immutable,
+	 * so no writes to the aliased text are needed. This is an experimental
+	 * compatibility path; only an RX-verified alias can be kept. */
+	constexpr vm_prot_t required = VM_PROT_READ | VM_PROT_EXECUTE;
 	vm_address_t target = destination;
-	vm_prot_t current_protection = VM_PROT_NONE;
-	vm_prot_t maximum_protection = VM_PROT_NONE;
+	vm_prot_t current_protection = required;
+	vm_prot_t maximum_protection = required;
 	const kern_return_t result = vm_remap(mach_task_self(), &target,
 		length, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(),
-		reinterpret_cast<vm_address_t>(source), FALSE,
+		reinterpret_cast<vm_address_t>(source), TRUE,
 		&current_protection, &maximum_protection, VM_INHERIT_NONE);
-	if (result == KERN_SUCCESS && target == destination) {
-		if (!::uml::runtime::keep_signed_kernel_text(
-			    reinterpret_cast<void *>(destination), length))
-			fprintf(stderr,
-				"UML ELF: cannot keep signed kernel text at %#lx; the "
-				"guest cannot restart in place\n",
-				static_cast<unsigned long>(destination));
-		/* A panic rewrites the kernel's frames to the carrier bytes this
-		 * range reads from, which the crash report can symbolize. A restart
-		 * finds the alias kept and this record in place. */
-		(void)::uml::runtime::record_kernel_text_alias(
-			reinterpret_cast<const void *>(destination), length, source);
+
+	/* A remap may be created read-only even when maximum_protection allows
+	 * execution. In that limited case, request RX without ever requesting
+	 * writable + executable memory. */
+	if (result == KERN_SUCCESS && target == destination &&
+	    (maximum_protection & required) == required &&
+	    (current_protection & required) != required) {
+		if (vm_protect(mach_task_self(), target, length, FALSE, required) ==
+		    KERN_SUCCESS)
+			current_protection = required;
 	}
 	if (result != KERN_SUCCESS || target != destination ||
-	    (current_protection & (VM_PROT_READ | VM_PROT_EXECUTE)) !=
-		(VM_PROT_READ | VM_PROT_EXECUTE) ||
-	    (maximum_protection & VM_PROT_EXECUTE) == 0) {
+	    (current_protection & required) != required ||
+	    (maximum_protection & required) != required) {
+		/* Query the signed carrier's first source page to distinguish
+		 * a read-only source segment from an iOS remap-policy rejection. */
+		vm_address_t source_region = reinterpret_cast<vm_address_t>(source);
+		vm_size_t source_region_size = 0;
+		vm_region_basic_info_data_64_t source_info = {};
+		mach_msg_type_number_t source_count = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t source_object = MACH_PORT_NULL;
+		const kern_return_t source_result = vm_region_64(
+			mach_task_self(), &source_region, &source_region_size,
+			VM_REGION_BASIC_INFO_64,
+			reinterpret_cast<vm_region_info_t>(&source_info),
+			&source_count, &source_object);
+		if (source_object != MACH_PORT_NULL)
+			(void)mach_port_deallocate(mach_task_self(), source_object);
 		set_elf_error(
-			"UML ELF: cannot alias signed kernel text at %#lx "
-			"(target=%#lx, cur=%#x, max=%#x): %s",
+			"UML ELF: signed RX remap failed source=%#lx dest=%#lx "
+			"(kr=%d target=%#lx cur=%#x max=%#x "
+			"source_kr=%d source_cur=%#x source_max=%#x): %s",
+			static_cast<unsigned long>(reinterpret_cast<uintptr_t>(source)),
 			static_cast<unsigned long>(destination),
+			static_cast<int>(result),
 			static_cast<unsigned long>(target),
 			static_cast<unsigned int>(current_protection),
 			static_cast<unsigned int>(maximum_protection),
+			static_cast<int>(source_result),
+			static_cast<unsigned int>(source_result == KERN_SUCCESS ?
+				source_info.protection : VM_PROT_NONE),
+			static_cast<unsigned int>(source_result == KERN_SUCCESS ?
+				source_info.max_protection : VM_PROT_NONE),
 			mach_error_string(result));
 		return -1;
 	}
+
+	/* Do not poison the process with a permanent non-executable alias.
+	 * Keep and symbolize only after both current and maximum RX checks pass. */
+	if (!::uml::runtime::keep_signed_kernel_text(
+	    reinterpret_cast<void *>(destination), length))
+		fprintf(stderr,
+			"UML ELF: cannot keep signed kernel text at %#lx; "
+			"the guest cannot restart in place\\n",
+			static_cast<unsigned long>(destination));
+	(void)::uml::runtime::record_kernel_text_alias(
+		reinterpret_cast<const void *>(destination), length, source);
 	return 0;
 }
 
