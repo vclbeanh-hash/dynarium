@@ -3,6 +3,7 @@
 #include "kernel_resources.hpp"
 #include "session_record.hpp"
 #include "kernel_signal_scope.hpp"
+#include "native_kernel_layout.hpp"
 #include "kernel_threads.hpp"
 #include "uml_elf64.h"
 
@@ -93,6 +94,18 @@ struct DynamicInfo final {
  * Signed text an earlier load left in place stays (reserve_kernel_image). */
 [[nodiscard]] void *reserve_in_place(void *address, size_t length) noexcept
 {
+	/* The process already reserved this address range with PROT_NONE.
+	 * On the first boot, replacing that fresh reservation with another
+	 * MAP_FIXED anonymous reservation can fail with ENOMEM on iOS 16.
+	 * The first load needs no reset; subsequent loads must clear stale
+	 * kernel data while preserving signed executable aliases. */
+	if (::uml::runtime::claim_fresh_native_kernel_window(
+	    reinterpret_cast<std::uintptr_t>(address), length)) {
+		std::fprintf(stderr,
+			"UML ELF: using fresh pre-reserved kernel window at %p "
+			"(%zu bytes)\\n", address, length);
+		return address;
+	}
 	return ::uml::runtime::reserve_kernel_image(address, length) == 0 ?
 		address : MAP_FAILED;
 }
@@ -716,7 +729,12 @@ private:
 			PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
 	Reservation reservation{mapped, reservation_length, in_window};
 	if (mapped == MAP_FAILED) {
-		set_elf_errno("UML ELF: mmap");
+		const int error = errno;
+		set_elf_error("UML ELF: mmap kernel window %#llx..%#llx "
+			"(in_window=%d, errno=%d): %s",
+			static_cast<unsigned long long>(minimum),
+			static_cast<unsigned long long>(maximum),
+			in_window ? 1 : 0, error, strerror(error));
 		return 126;
 	}
 	if (reinterpret_cast<uintptr_t>(mapped) != minimum) {
