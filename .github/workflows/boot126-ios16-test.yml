@@ -22,9 +22,16 @@ concurrency:
 jobs:
   build-ios16-ipa:
     name: Build Dynarium Universal (iOS 16.0+)
-    runs-on: macos-26
+    runs-on: macos-15
     timeout-minutes: 90
     steps:
+      - name: Select Xcode 26.2 on macOS 15 arm64
+        run: |
+          set -e
+          sudo xcode-select -s /Applications/Xcode_26.2.app/Contents/Developer
+          xcodebuild -version
+          test "$(uname -m)" = arm64
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
