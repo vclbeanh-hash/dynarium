@@ -101,9 +101,9 @@ struct DynamicInfo final {
 	 * kernel data while preserving signed executable aliases. */
 	if (::uml::runtime::claim_fresh_native_kernel_window(
 	    reinterpret_cast<std::uintptr_t>(address), length)) {
-		std::fprintf(stderr,
+		fprintf(stderr,
 			"UML ELF: using fresh pre-reserved kernel window at %p "
-			"(%zu bytes)\\n", address, length);
+			"(%zu bytes)\n", address, length);
 		return address;
 	}
 	return ::uml::runtime::reserve_kernel_image(address, length) == 0 ?
