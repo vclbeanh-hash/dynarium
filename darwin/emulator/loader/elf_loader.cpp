@@ -245,7 +245,7 @@ private:
 	    reinterpret_cast<void *>(destination), length))
 		fprintf(stderr,
 			"UML ELF: cannot keep signed kernel text at %#lx; "
-			"the guest cannot restart in place\\n",
+			"the guest cannot restart in place\n",
 			static_cast<unsigned long>(destination));
 	(void)::uml::runtime::record_kernel_text_alias(
 		reinterpret_cast<const void *>(destination), length, source);
