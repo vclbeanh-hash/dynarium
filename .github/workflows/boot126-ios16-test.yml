@@ -1,0 +1,186 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Experimental iOS 16-only build to test the ELF126 signed RX COW alias.
+# Produces a downloadable GitHub Actions artifact; does not publish a Release.
+name: Dynarium iOS16 Boot126 RX Trial
+
+on:
+  push:
+    branches: ['fix/ios16-elf126-cow-remap']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  checks: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: boot126-ios16-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios16-ipa:
+    name: Build Dynarium Universal (iOS 16.0+)
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify host, LF line endings, license headers & source audit
+        run: |
+          uname -a
+          xcodebuild -version
+          [ "$(uname -m)" = "arm64" ]
+          python3 - <<'EOF'
+          import pathlib, subprocess, sys
+          tracked = subprocess.check_output(["git", "ls-files"], text=True).splitlines()
+          exts = {".sh", ".py", ".tsv", ".cmake", ".yml", ".yaml", ".json", ".swift", ".h", ".plist", ".xcconfig"}
+          names = {"CMakeLists.txt", "CMakePresets.json", ".gitattributes", ".gitignore"}
+          bad = []
+          for rel in tracked:
+              p = pathlib.Path(rel)
+              if rel.startswith("dependencies/patches/"):
+                  continue
+              if p.suffix in exts or p.name in names:
+                  data = p.read_bytes()
+                  if b"\r" in data or data.startswith(b"\xef\xbb\xbf"):
+                      bad.append(rel)
+          if bad:
+              sys.exit(f"CRLF or BOM found in: {bad}")
+          print("Line ending and BOM check passed.")
+          EOF
+          cmake -DSOURCE_ROOT="$PWD" -P scripts/audit-source-tree.cmake
+          python3 -B tests/tooling/cmake/check_license_headers.py --source-root "$PWD"
+
+      - name: Install build & packaging tools
+        run: |
+          brew install cmake ninja xcodegen ldid
+
+      - name: Restore prebuilt iOS 16 dependencies (deps-ios16-latest)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          log=$(mktemp)
+          if (
+            set -e
+            mkdir -p .build
+            gh release download deps-ios16-latest -R userlethekhoi/dynarium -p dynarium-deps-ios16-arm64.tar.gz -D .build --clobber
+            tar -xzf .build/dynarium-deps-ios16-arm64.tar.gz -C .build
+            rm -f .build/dynarium-deps-ios16-arm64.tar.gz
+            ./dependencies/build-ios-zstd.sh --verify-only
+            ./dependencies/build-ios-storage.sh --verify-only
+            ./dependencies/build-ios-network.sh --platform ios --verify-only
+            ./dependencies/build-apple-gpu.sh --platform ios --verify-only
+          ) >"$log" 2>&1; then
+            cat "$log"; rm -f "$log"
+          else
+            rc=$?; cat "$log"
+            { printf '=== FAILED: restore-deps-ios16 (exit %s) ===\n' "$rc"; cat "$log"; } > /tmp/ci-failure.log
+            { echo "### Failed: restore-deps-ios16"; echo '````text'; tail -n 80 "$log"; echo '````'; } >> "$GITHUB_STEP_SUMMARY"
+            rm -f "$log"; exit "$rc"
+          fi
+
+      - name: Download accepted Android 6.18 4K kernel artifact
+        run: |
+          mkdir -p .build/kernel/artifacts .build/kernel/tmp
+          curl -fL --retry 3 \
+            -o .build/kernel/tmp/android-kernel.tar.gz \
+            https://github.com/imxieyi/Kernarium/releases/download/1.0b9-beta/android-6.18-arm64-4k-20261111-6.18.60-mc2.tar.gz
+          tar -xzf .build/kernel/tmp/android-kernel.tar.gz -C .build/kernel/tmp
+          bundle_dir=".build/kernel/artifacts/android-6.18-arm64-4k-20261111-6.18.60-mc2"
+          if [ -d ".build/kernel/tmp/android-6.18-arm64-4k-20261111-6.18.60-mc2/kernel" ]; then
+            mv .build/kernel/tmp/android-6.18-arm64-4k-20261111-6.18.60-mc2 "$bundle_dir"
+          elif [ -d ".build/kernel/tmp/kernel" ]; then
+            mkdir -p "$bundle_dir"
+            mv .build/kernel/tmp/* "$bundle_dir/" || true
+          else
+            echo "Unexpected Android kernel archive layout" >&2
+            exit 1
+          fi
+          rm -rf .build/kernel/tmp
+          test -f "$bundle_dir/kernel/vmlinux"
+
+      - name: Build KernariumRuntime (Android 17, iOS 16.0) & package XCFrameworks
+        run: |
+          log=$(mktemp)
+          if (
+            set -e
+            cmake --preset kernarium-ios-device-android
+            cmake --build --preset kernarium-ios-device-android
+            ./Dynarium/scripts/package-dynarium-frameworks.sh --tier ios16-universal
+          ) >"$log" 2>&1; then
+            cat "$log"; rm -f "$log"
+          else
+            rc=$?; cat "$log"
+            { printf '=== FAILED: runtime-and-frameworks-ios16 (exit %s) ===\n' "$rc"; cat "$log"; } > /tmp/ci-failure.log
+            { echo "### Failed: runtime-and-frameworks-ios16"; echo '````text'; tail -n 100 "$log"; echo '````'; } >> "$GITHUB_STEP_SUMMARY"
+            rm -f "$log"; exit "$rc"
+          fi
+
+      - name: Generate Xcode project, compile Dynarium (iOS 16.0) & package IPA
+        run: |
+          log=$(mktemp)
+          if (
+            set -e
+            (CDPATH= cd -- "$PWD/Dynarium" && xcodegen generate)
+            xcodebuild \
+              -project Dynarium/Dynarium.xcodeproj \
+              -scheme Dynarium \
+              -configuration Release \
+              -sdk iphoneos \
+              -destination 'generic/platform=iOS' \
+              -derivedDataPath .build/xcode-ios16 \
+              CODE_SIGNING_ALLOWED=NO \
+              CODE_SIGNING_REQUIRED=NO \
+              CODE_SIGN_IDENTITY="" \
+              IPHONEOS_DEPLOYMENT_TARGET=16.0 \
+              build
+            VERSION=$(grep '^MARKETING_VERSION' Dynarium/Config/Version.xcconfig | sed 's/.*=[[:space:]]*//' | tr -d ' \r\n')
+            ./Dynarium/scripts/package-ipa.sh \
+              --app .build/xcode-ios16/Build/Products/Release-iphoneos/Dynarium.app \
+              --output "artifacts/Dynarium-v${VERSION}.ipa" \
+              --expected-minos 16.0
+          ) >"$log" 2>&1; then
+            cat "$log"; rm -f "$log"
+          else
+            rc=$?; cat "$log"
+            { printf '=== FAILED: xcodebuild-and-ipa-ios16 (exit %s) ===\n' "$rc"; cat "$log"; } > /tmp/ci-failure.log
+            { echo "### Failed: xcodebuild-and-ipa-ios16"; echo '````text'; tail -n 120 "$log"; echo '````'; } >> "$GITHUB_STEP_SUMMARY"
+            rm -f "$log"; exit "$rc"
+          fi
+
+      - name: Upload Universal iOS 16+ IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynarium-ipa-ios16
+          path: artifacts/Dynarium-v*.ipa
+          retention-days: 30
+
+      - name: Publish failure diagnostics check-run (iOS 16)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, pathlib, subprocess
+          p = pathlib.Path("/tmp/ci-failure.log")
+          text = p.read_text(encoding="utf-8", errors="replace")[-60000:] if p.exists() else "Step failed outside wrapped log capture."
+          payload = {
+              "name": "ci-failure-diagnostics-ios16",
+              "head_sha": os.environ["GITHUB_SHA"],
+              "status": "completed",
+              "conclusion": "failure",
+              "output": {
+                  "title": "iOS 16 IPA CI Failure Log",
+                  "summary": "```text\n" + text + "\n```",
+              },
+          }
+          subprocess.run(
+              ["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/check-runs", "--input", "-"],
+              input=json.dumps(payload),
+              text=True,
+              check=False,
+          )
+          EOF
