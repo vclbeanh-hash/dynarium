@@ -92,18 +92,66 @@ struct DynamicInfo final {
  * reservation rather than to the process: the window outlives the run, and a
  * range freed inside it is where Darwin puts the next unhinted allocation.
  * Signed text an earlier load left in place stays (reserve_kernel_image). */
+/* An iOS 16 host can refuse to overwrite a large anonymous PROT_NONE
+ * reservation with a second MAP_FIXED mmap (ENOMEM). It is not necessary
+ * to remap pages that are already protectionless: the ELF loader will
+ * replace/initialize every page it needs individually. Walk the exact
+ * target interval so this fallback never treats holes or old guest data
+ * as clean memory, and never relaxes an executable page. */
+[[nodiscard]] bool entirely_protectionless(std::uintptr_t begin,
+	size_t length) noexcept
+{
+	if (length == 0 || begin > UINTPTR_MAX - length)
+		return false;
+	const std::uintptr_t end = begin + length;
+	vm_address_t cursor = static_cast<vm_address_t>(begin);
+	while (static_cast<std::uintptr_t>(cursor) < end) {
+		vm_address_t region = cursor;
+		vm_size_t region_size = 0;
+		vm_region_basic_info_data_64_t info = {};
+		mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t object = MACH_PORT_NULL;
+		const kern_return_t result = vm_region_64(
+			mach_task_self(), &region, &region_size,
+			VM_REGION_BASIC_INFO_64,
+			reinterpret_cast<vm_region_info_t>(&info),
+			&count, &object);
+		if (object != MACH_PORT_NULL)
+			(void)mach_port_deallocate(mach_task_self(), object);
+		if (result != KERN_SUCCESS ||
+		    static_cast<std::uintptr_t>(region) >
+			static_cast<std::uintptr_t>(cursor) ||
+		    region_size == 0 || info.protection != VM_PROT_NONE ||
+		    static_cast<std::uintptr_t>(region) >
+			UINTPTR_MAX - region_size)
+			return false;
+		const std::uintptr_t next =
+			static_cast<std::uintptr_t>(region) + region_size;
+		if (next <= static_cast<std::uintptr_t>(cursor))
+			return false;
+		cursor = static_cast<vm_address_t>(next);
+	}
+	return true;
+}
+
 [[nodiscard]] void *reserve_in_place(void *address, size_t length) noexcept
 {
-	/* The process already reserved this address range with PROT_NONE.
-	 * On the first boot, replacing that fresh reservation with another
-	 * MAP_FIXED anonymous reservation can fail with ENOMEM on iOS 16.
-	 * The first load needs no reset; subsequent loads must clear stale
-	 * kernel data while preserving signed executable aliases. */
-	if (::uml::runtime::claim_fresh_native_kernel_window(
-	    reinterpret_cast<std::uintptr_t>(address), length)) {
+	const auto begin = reinterpret_cast<std::uintptr_t>(address);
+	/* The very first load uses the untouched window without resetting it. */
+	if (::uml::runtime::claim_fresh_native_kernel_window(begin, length)) {
 		fprintf(stderr,
-			"UML ELF: using fresh pre-reserved kernel window at %p "
-			"(%zu bytes)\n", address, length);
+			"UML ELF: first kernel load reuses reserved window "
+			"%p (%zu bytes)\n", address, length);
+		return address;
+	}
+	/* If a prior attempt stopped before writing any of these pages,
+	 * a second MAP_FIXED PROT_NONE allocation is likewise unnecessary.
+	 * Reject this shortcut whenever any page is writable/executable, so
+	 * old guest state is always reinitialized by the original routine. */
+	if (entirely_protectionless(begin, length)) {
+		fprintf(stderr,
+			"UML ELF: reusing verified PROT_NONE kernel window "
+			"%p (%zu bytes)\n", address, length);
 		return address;
 	}
 	return ::uml::runtime::reserve_kernel_image(address, length) == 0 ?
