@@ -178,6 +178,14 @@ struct ProcessNativeWindow final {
 };
 [[nodiscard]] ProcessNativeWindow process_native_window() noexcept;
 
+/* Claim the untouched portion of the process's first PROT_NONE reservation
+ * for the first kernel load only. This avoids reissuing a large MAP_FIXED
+ * PROT_NONE mmap on iOS 16, where replacement may fail with ENOMEM even
+ * though the window was already reserved. Subsequent loads must reset
+ * their previous mappings through reserve_host_range(). */
+[[nodiscard]] bool claim_fresh_native_kernel_window(
+	std::uintptr_t address, std::size_t length) noexcept;
+
 class NativeKernelLayoutScope final {
 public:
 	explicit NativeKernelLayoutScope(
