@@ -20,6 +20,7 @@ struct ProcessWindow final {
 	std::mutex mutex;
 	std::uintptr_t begin{};
 	std::uintptr_t end{};
+	bool fresh{};
 };
 
 /* Never destroyed: a guest thread can still run when the process ends. */
@@ -145,6 +146,7 @@ NativeKernelLayout reserve_process_native_window(
 			process_window.begin = window.window_start;
 			process_window.end = window.window_start +
 				host_reservation_length(candidate_length);
+			process_window.fresh = true;
 			return reserved_layout(process_window.begin, length);
 		}
 	}
@@ -193,6 +195,7 @@ NativeKernelLayout reserve_process_native_window(
 			process_window.end - process_window.begin);
 	process_window.begin = window.window_start;
 	process_window.end = window.window_start + host_reservation_length(length);
+	process_window.fresh = true;
 	return window;
 }
 
@@ -200,6 +203,21 @@ ProcessNativeWindow process_native_window() noexcept
 {
 	std::lock_guard lock{process_window.mutex};
 	return {process_window.begin, process_window.end};
+}
+
+bool claim_fresh_native_kernel_window(
+	std::uintptr_t address, std::size_t length) noexcept
+{
+	std::lock_guard lock{process_window.mutex};
+	if (!process_window.fresh || length == 0 ||
+	    address < process_window.begin || address >= process_window.end ||
+	    length > process_window.end - address)
+		return false;
+	/* The reservation was allocated as one intact PROT_NONE mapping, and
+	 * nobody has installed the guest kernel into it yet. Consume once:
+	 * later launches must explicitly reset their old kernel data pages. */
+	process_window.fresh = false;
+	return true;
 }
 
 NativeKernelLayout reserve_native_kernel_window(
